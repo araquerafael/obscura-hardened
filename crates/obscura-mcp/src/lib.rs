@@ -78,6 +78,7 @@ pub struct BrowserState {
     context: Arc<BrowserContext>,
     user_agent: Option<String>,
     operator_network_hints: bool,
+    allow_session_tools: bool,
     console_messages: Vec<String>,
     /// Element-ref table from the last `browser_snapshot` on the ACTIVE
     /// tab. Agents click / fill / type by `ref` (e.g. `"e3"`) instead of
@@ -109,6 +110,7 @@ impl BrowserState {
             context: Arc::new(context),
             user_agent,
             operator_network_hints: false,
+            allow_session_tools: std::env::var("OBSCURA_MCP_ALLOW_SESSION_TOOLS").as_deref() == Ok("1"),
             console_messages: Vec::new(),
             interactive_refs: HashMap::new(),
             ref_generation: 0,
@@ -255,7 +257,7 @@ pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mu
     match method {
         "initialize" => handle_initialize(id, params),
         "ping" => RpcResponse::ok(id, json!({})),
-        "tools/list" => handle_tools_list(id),
+        "tools/list" => handle_tools_list(id, state.allow_session_tools),
         "tools/call" => handle_tool_call(id, params, state).await,
         "resources/list" => RpcResponse::ok(id, json!({"resources": []})),
         "prompts/list" => RpcResponse::ok(id, json!({"prompts": []})),
@@ -350,7 +352,15 @@ fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
     }))
 }
 
-fn handle_tools_list(id: Value) -> RpcResponse {
+fn is_session_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "browser_get_cookies" | "browser_set_cookie" | "browser_clear_cookies"
+            | "browser_storage_state" | "browser_set_storage_state"
+    )
+}
+
+fn handle_tools_list(id: Value, allow_session_tools: bool) -> RpcResponse {
     #[allow(unused_mut)]
     let mut tools = json!([
             {
@@ -794,6 +804,9 @@ fn handle_tools_list(id: Value) -> RpcResponse {
         }));
     }
 
+    if !allow_session_tools {
+        tools.retain(|tool| !tool["name"].as_str().is_some_and(is_session_tool));
+    }
     RpcResponse::ok(id, json!({ "tools": tools }))
 }
 
@@ -802,6 +815,9 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         Some(n) => n,
         None => return RpcResponse::err(id, -32602, "Missing tool name"),
     };
+    if !state.allow_session_tools && is_session_tool(name) {
+        return RpcResponse::err(id, -32602, "Direct cookie and session tools are disabled");
+    }
     let args = params.get("arguments").unwrap_or(&Value::Null);
 
     #[cfg(feature = "render")]
@@ -2994,8 +3010,31 @@ mod tests {
     }
 
     fn listed_tools() -> Vec<Value> {
-        handle_tools_list(json!(1)).result.expect("tools/list result")
+        handle_tools_list(json!(1), false).result.expect("tools/list result")
             .get("tools").and_then(Value::as_array).cloned().expect("tools array")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_tools_are_hidden_and_rejected_when_disabled() {
+        let mut state = BrowserState::new(None, None, false);
+        state.allow_session_tools = false;
+        let tools = listed_tools();
+        let enabled = handle_tools_list(json!(1), true).result.unwrap();
+        for name in [
+            "browser_get_cookies",
+            "browser_set_cookie",
+            "browser_clear_cookies",
+            "browser_storage_state",
+            "browser_set_storage_state",
+        ] {
+            assert!(enabled["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == name));
+            assert!(!tools.iter().any(|tool| tool["name"] == name));
+            let response = handle_tool_call(json!(1), &json!({"name": name}), &mut state).await;
+            assert_eq!(response.error.unwrap().message, "Direct cookie and session tools are disabled");
+        }
+        for name in ["browser_navigate", "browser_evaluate", "browser_fill_form"] {
+            assert!(tools.iter().any(|tool| tool["name"] == name));
+        }
     }
 
     #[test]
